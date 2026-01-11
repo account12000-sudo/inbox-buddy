@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -16,6 +16,7 @@ import {
   Clock,
   AlertCircle,
   Loader2,
+  AlertTriangle,
 } from 'lucide-react';
 
 interface Campaign {
@@ -35,14 +36,49 @@ interface QueueItem {
   status: string;
 }
 
+interface SmtpSettings {
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+  fromEmail: string;
+  fromName: string;
+  encryption: 'tls' | 'ssl' | 'none';
+}
+
+const STORAGE_KEY = 'smtp_settings';
+
 export default function CampaignProgress() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, session } = useAuth();
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [sendingEmail, setSendingEmail] = useState<string | null>(null);
+  const [smtpSettings, setSmtpSettings] = useState<SmtpSettings | null>(null);
+  const [smtpError, setSmtpError] = useState<string | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const isRunningRef = useRef(false);
+
+  // Load SMTP settings
+  useEffect(() => {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      try {
+        const settings = JSON.parse(saved);
+        if (settings.host && settings.port && settings.username && settings.password && settings.fromEmail) {
+          setSmtpSettings(settings);
+        } else {
+          setSmtpError('SMTP settings are incomplete. Please configure in Settings.');
+        }
+      } catch (e) {
+        setSmtpError('Failed to load SMTP settings. Please configure in Settings.');
+      }
+    } else {
+      setSmtpError('SMTP not configured. Please set up your email server in Settings.');
+    }
+  }, []);
 
   const fetchCampaign = useCallback(async () => {
     if (!id || !user) return;
@@ -79,79 +115,111 @@ export default function CampaignProgress() {
     fetchCampaign();
   }, [fetchCampaign]);
 
-  // Simulate sending emails (in real app, this would be done via edge function)
-  useEffect(() => {
-    if (!campaign || campaign.status !== 'running') return;
+  // Send email via edge function
+  const sendEmail = useCallback(async (queueItem: QueueItem) => {
+    if (!campaign || !smtpSettings || !session) return false;
+
+    setSendingEmail(queueItem.recipient_email);
+
+    try {
+      const response = await supabase.functions.invoke('send-email', {
+        body: {
+          queueItemId: queueItem.id,
+          campaignId: campaign.id,
+          recipientEmail: queueItem.recipient_email,
+          subject: campaign.subject,
+          body: campaign.body,
+          smtp: {
+            host: smtpSettings.host,
+            port: parseInt(smtpSettings.port),
+            username: smtpSettings.username,
+            password: smtpSettings.password,
+            fromEmail: smtpSettings.fromEmail,
+            fromName: smtpSettings.fromName,
+            encryption: smtpSettings.encryption,
+          },
+        },
+      });
+
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
+
+      const data = response.data;
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to send email');
+      }
+
+      // Update local state
+      setQueue((prev) =>
+        prev.map((q) => (q.id === queueItem.id ? { ...q, status: 'sent' } : q))
+      );
+      setCampaign((prev) =>
+        prev ? { ...prev, sent_count: prev.sent_count + 1 } : null
+      );
+
+      return true;
+    } catch (error: any) {
+      console.error('Error sending email:', error);
+      setQueue((prev) =>
+        prev.map((q) => (q.id === queueItem.id ? { ...q, status: 'failed' } : q))
+      );
+      toast.error(`Failed to send to ${queueItem.recipient_email}: ${error.message}`);
+      return false;
+    } finally {
+      setSendingEmail(null);
+    }
+  }, [campaign, smtpSettings, session]);
+
+  // Process email queue
+  const processQueue = useCallback(async () => {
+    if (!campaign || campaign.status !== 'running' || !smtpSettings) return;
 
     const pendingEmails = queue.filter((q) => q.status === 'pending');
+    
     if (pendingEmails.length === 0) {
       // Campaign complete
-      supabase
+      await supabase
         .from('campaigns')
         .update({ status: 'completed' })
         .eq('id', campaign.id);
       setCampaign((prev) => prev ? { ...prev, status: 'completed' } : null);
       toast.success('Campaign completed!');
+      isRunningRef.current = false;
       return;
     }
 
-    const timer = setTimeout(async () => {
-      const nextEmail = pendingEmails[0];
-      if (!nextEmail || !user) return;
+    const nextEmail = pendingEmails[0];
+    await sendEmail(nextEmail);
 
-      setSendingEmail(nextEmail.recipient_email);
+    // Schedule next email
+    if (isRunningRef.current) {
+      timerRef.current = window.setTimeout(() => {
+        processQueue();
+      }, campaign.interval_seconds * 1000);
+    }
+  }, [campaign, queue, smtpSettings, sendEmail]);
 
-      try {
-        // Mark as sending
-        await supabase
-          .from('email_queue')
-          .update({ status: 'sent' })
-          .eq('id', nextEmail.id);
+  // Start/stop the queue processor
+  useEffect(() => {
+    if (campaign?.status === 'running' && smtpSettings && !isRunningRef.current) {
+      isRunningRef.current = true;
+      processQueue();
+    }
 
-        // Record in sent_emails (using upsert to handle duplicates)
-        await supabase.from('sent_emails').upsert(
-          {
-            user_id: user.id,
-            campaign_id: campaign.id,
-            recipient_email: nextEmail.recipient_email,
-            subject: campaign.subject,
-            status: 'sent',
-          },
-          { onConflict: 'user_id,recipient_email' }
-        );
-
-        // Update campaign sent count
-        await supabase
-          .from('campaigns')
-          .update({ sent_count: campaign.sent_count + 1 })
-          .eq('id', campaign.id);
-
-        // Update local state
-        setQueue((prev) =>
-          prev.map((q) => (q.id === nextEmail.id ? { ...q, status: 'sent' } : q))
-        );
-        setCampaign((prev) =>
-          prev ? { ...prev, sent_count: prev.sent_count + 1 } : null
-        );
-      } catch (error) {
-        console.error('Error sending email:', error);
-        await supabase
-          .from('email_queue')
-          .update({ status: 'failed' })
-          .eq('id', nextEmail.id);
-        setQueue((prev) =>
-          prev.map((q) => (q.id === nextEmail.id ? { ...q, status: 'failed' } : q))
-        );
-      } finally {
-        setSendingEmail(null);
+    return () => {
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
       }
-    }, campaign.interval_seconds * 1000);
-
-    return () => clearTimeout(timer);
-  }, [campaign, queue, user]);
+    };
+  }, [campaign?.status, smtpSettings, processQueue]);
 
   const handlePause = async () => {
     if (!campaign) return;
+    isRunningRef.current = false;
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+    }
     await supabase.from('campaigns').update({ status: 'paused' }).eq('id', campaign.id);
     setCampaign((prev) => prev ? { ...prev, status: 'paused' } : null);
     toast.info('Campaign paused');
@@ -161,11 +229,17 @@ export default function CampaignProgress() {
     if (!campaign) return;
     await supabase.from('campaigns').update({ status: 'running' }).eq('id', campaign.id);
     setCampaign((prev) => prev ? { ...prev, status: 'running' } : null);
+    isRunningRef.current = true;
     toast.success('Campaign resumed');
+    processQueue();
   };
 
   const handleStop = async () => {
     if (!campaign) return;
+    isRunningRef.current = false;
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+    }
     await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaign.id);
     setCampaign((prev) => prev ? { ...prev, status: 'completed' } : null);
     toast.info('Campaign stopped');
@@ -200,6 +274,20 @@ export default function CampaignProgress() {
   return (
     <AppLayout title="Campaign Progress">
       <div className="max-w-4xl space-y-6">
+        {/* SMTP Warning */}
+        {smtpError && (
+          <div className="flex items-center gap-3 p-4 rounded-lg bg-warning/10 text-warning border border-warning/20">
+            <AlertTriangle className="h-5 w-5 shrink-0" />
+            <div className="flex-1">
+              <p className="font-medium">SMTP Configuration Required</p>
+              <p className="text-sm opacity-80">{smtpError}</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>
+              Go to Settings
+            </Button>
+          </div>
+        )}
+
         {/* Campaign Header */}
         <Card>
           <CardHeader>
@@ -249,7 +337,7 @@ export default function CampaignProgress() {
               )}
               {campaign.status === 'paused' && (
                 <>
-                  <Button onClick={handleResume}>
+                  <Button onClick={handleResume} disabled={!smtpSettings}>
                     <Play className="mr-2 h-4 w-4" />
                     Resume
                   </Button>
@@ -262,6 +350,12 @@ export default function CampaignProgress() {
               {campaign.status === 'completed' && (
                 <Button variant="outline" onClick={() => navigate('/dashboard')}>
                   Back to Dashboard
+                </Button>
+              )}
+              {campaign.status === 'draft' && smtpSettings && (
+                <Button onClick={handleResume}>
+                  <Play className="mr-2 h-4 w-4" />
+                  Start Campaign
                 </Button>
               )}
             </div>
@@ -338,6 +432,8 @@ export default function CampaignProgress() {
                         ? 'default'
                         : item.status === 'failed'
                         ? 'destructive'
+                        : item.status === 'sending'
+                        ? 'outline'
                         : 'secondary'
                     }
                   >
