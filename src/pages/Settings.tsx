@@ -6,7 +6,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { toast } from 'sonner';
-import { Loader2, Mail, Server, Key, Shield, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Loader2, Mail, Server, Key, Shield, CheckCircle2, AlertCircle, Send } from 'lucide-react';
+import { supabase } from '@/integrations/supabase/client';
+import { useAuth } from '@/hooks/useAuth';
 
 interface SmtpSettings {
   host: string;
@@ -21,6 +23,7 @@ interface SmtpSettings {
 const STORAGE_KEY = 'smtp_settings';
 
 export default function Settings() {
+  const { user } = useAuth();
   const [settings, setSettings] = useState<SmtpSettings>({
     host: '',
     port: '587',
@@ -33,6 +36,7 @@ export default function Settings() {
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<'success' | 'error' | null>(null);
+  const [testEmail, setTestEmail] = useState('');
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -61,17 +65,46 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      // For now, just validate the settings are filled
-      if (!settings.host || !settings.port || !settings.username || !settings.password) {
-        throw new Error('Please fill in all SMTP fields');
+      if (!settings.host || !settings.port || !settings.username || !settings.password || !settings.fromEmail) {
+        throw new Error('Please fill in all SMTP fields including From Email');
       }
-      // Simulate a test (actual test would require edge function)
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      if (!testEmail) {
+        throw new Error('Please enter a test email address');
+      }
+
+      const response = await supabase.functions.invoke('send-email', {
+        body: {
+          recipientEmail: testEmail,
+          subject: 'SMTP Test Email - Your Setup Works!',
+          body: `This is a test email from your email outreach tool.\n\nIf you received this, your SMTP configuration is working correctly!\n\nSettings used:\n- Host: ${settings.host}\n- Port: ${settings.port}\n- Encryption: ${settings.encryption}\n- From: ${settings.fromName ? `${settings.fromName} <${settings.fromEmail}>` : settings.fromEmail}`,
+          smtp: {
+            host: settings.host,
+            port: parseInt(settings.port),
+            username: settings.username,
+            password: settings.password,
+            fromEmail: settings.fromEmail,
+            fromName: settings.fromName,
+            encryption: settings.encryption,
+          },
+          testMode: true,
+        },
+      });
+
+      if (response.error) {
+        throw new Error(response.error.message);
+      }
+
+      const data = response.data;
+      if (!data.success) {
+        throw new Error(data.error || 'Failed to send test email');
+      }
+
       setTestResult('success');
-      toast.success('SMTP connection test passed!');
+      toast.success(`Test email sent to ${testEmail}! Check your inbox.`);
     } catch (error: any) {
+      console.error('Test email error:', error);
       setTestResult('error');
-      toast.error(error.message || 'SMTP connection test failed');
+      toast.error(error.message || 'SMTP test failed');
     } finally {
       setTesting(false);
     }
@@ -241,18 +274,60 @@ export default function Settings() {
           </CardContent>
         </Card>
 
+        {/* Send Test Email */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-primary/10">
+                <Send className="h-5 w-5 text-primary" />
+              </div>
+              <div>
+                <CardTitle>Send Test Email</CardTitle>
+                <CardDescription>
+                  Verify your SMTP configuration by sending a real test email
+                </CardDescription>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="testEmail">Test Email Address</Label>
+              <Input
+                id="testEmail"
+                type="email"
+                placeholder="your@email.com"
+                value={testEmail}
+                onChange={(e) => setTestEmail(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Enter your email to receive a test message
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <Button onClick={handleTest} disabled={testing || !testEmail}>
+                {testing ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : testResult === 'success' ? (
+                  <CheckCircle2 className="mr-2 h-4 w-4 text-success" />
+                ) : testResult === 'error' ? (
+                  <AlertCircle className="mr-2 h-4 w-4 text-destructive" />
+                ) : (
+                  <Send className="mr-2 h-4 w-4" />
+                )}
+                Send Test Email
+              </Button>
+              {testResult === 'success' && (
+                <span className="text-sm text-success">Check your inbox!</span>
+              )}
+              {testResult === 'error' && (
+                <span className="text-sm text-destructive">Failed - check settings</span>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
         {/* Actions */}
         <div className="flex items-center gap-3">
-          <Button onClick={handleTest} variant="outline" disabled={testing}>
-            {testing ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : testResult === 'success' ? (
-              <CheckCircle2 className="mr-2 h-4 w-4 text-success" />
-            ) : testResult === 'error' ? (
-              <AlertCircle className="mr-2 h-4 w-4 text-destructive" />
-            ) : null}
-            Test Connection
-          </Button>
           <Button onClick={handleSave} disabled={saving}>
             {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             Save Settings
