@@ -6,6 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { useAuth } from '@/hooks/useAuth';
 import { toast } from 'sonner';
 import { Mail, Lock, Loader2 } from 'lucide-react';
+import { getAuthErrorMessage } from '@/lib/errorMessages';
 
 export function AuthForm() {
   const [isSignUp, setIsSignUp] = useState(false);
@@ -28,8 +29,8 @@ export function AuthForm() {
         if (error) throw error;
         toast.success('Welcome back!');
       }
-    } catch (error: any) {
-      toast.error(error.message || 'Authentication failed');
+    } catch (error: unknown) {
+      toast.error(getAuthErrorMessage(error));
     } finally {
       setLoading(false);
     }

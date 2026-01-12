@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { toast } from 'sonner';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
+import { getSafeErrorMessage, getSmtpErrorMessage } from '@/lib/errorMessages';
 import {
   Play,
   Pause,
@@ -92,9 +93,9 @@ export default function CampaignProgress() {
 
       if (queueError) throw queueError;
       setQueue(queueData || []);
-    } catch (error) {
-      console.error('Error fetching campaign:', error);
-      toast.error('Failed to load campaign');
+    } catch (error: unknown) {
+      console.error('Campaign fetch error');
+      toast.error(getSafeErrorMessage(error));
       navigate('/dashboard');
     } finally {
       setLoading(false);
@@ -141,12 +142,11 @@ export default function CampaignProgress() {
 
       return true;
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      console.error('Error sending email:', errorMessage);
+      console.error('Email send error');
       setQueue((prev) =>
         prev.map((q) => (q.id === queueItem.id ? { ...q, status: 'failed' } : q))
       );
-      toast.error(`Failed to send to ${queueItem.recipient_email}`);
+      toast.error(`Failed to send to ${queueItem.recipient_email}. ${getSmtpErrorMessage(error)}`);
       return false;
     } finally {
       setSendingEmail(null);
