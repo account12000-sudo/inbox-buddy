@@ -9,7 +9,7 @@ import { toast } from 'sonner';
 import { Loader2, Mail, Server, Key, Shield, CheckCircle2, AlertCircle, Send } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { useAuth } from '@/hooks/useAuth';
-
+import { getSafeErrorMessage, getSmtpErrorMessage } from '@/lib/errorMessages';
 interface SmtpSettings {
   host: string;
   port: string;
@@ -132,9 +132,9 @@ export default function Settings() {
       // Clear password field after save
       setSettings(prev => ({ ...prev, password: '' }));
       toast.success('Settings saved successfully!');
-    } catch (error) {
-      console.error('Failed to save settings:', error);
-      toast.error('Failed to save settings');
+    } catch (error: unknown) {
+      console.error('Settings save error');
+      toast.error(getSafeErrorMessage(error));
     } finally {
       setSaving(false);
     }
@@ -175,10 +175,9 @@ export default function Settings() {
       setTestResult('success');
       toast.success(`Test email sent to ${testEmail}! Check your inbox.`);
     } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : 'SMTP test failed';
-      console.error('Test email error:', errorMessage);
+      console.error('Test email error');
       setTestResult('error');
-      toast.error(errorMessage);
+      toast.error(getSmtpErrorMessage(error));
     } finally {
       setTesting(false);
     }
