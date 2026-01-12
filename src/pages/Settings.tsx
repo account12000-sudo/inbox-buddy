@@ -20,8 +20,6 @@ interface SmtpSettings {
   encryption: 'tls' | 'ssl' | 'none';
 }
 
-const STORAGE_KEY = 'smtp_settings';
-
 export default function Settings() {
   const { user } = useAuth();
   const [settings, setSettings] = useState<SmtpSettings>({
@@ -33,28 +31,109 @@ export default function Settings() {
     fromName: '',
     encryption: 'tls',
   });
+  const [existingSettings, setExistingSettings] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<'success' | 'error' | null>(null);
   const [testEmail, setTestEmail] = useState('');
 
+  // Load SMTP settings from database
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
+    const loadSettings = async () => {
+      if (!user) return;
+      
       try {
-        setSettings(JSON.parse(saved));
-      } catch (e) {
-        console.error('Failed to parse SMTP settings');
+        const { data, error } = await supabase
+          .from('user_smtp_settings')
+          .select('*')
+          .eq('user_id', user.id)
+          .maybeSingle();
+        
+        if (error) throw error;
+        
+        if (data) {
+          setSettings({
+            host: data.host,
+            port: String(data.port),
+            username: data.username,
+            password: '', // Never show password
+            fromEmail: data.from_email,
+            fromName: data.from_name || '',
+            encryption: data.encryption as 'tls' | 'ssl' | 'none',
+          });
+          setExistingSettings(true);
+        }
+      } catch (error) {
+        console.error('Failed to load SMTP settings');
+      } finally {
+        setLoading(false);
       }
-    }
-  }, []);
+    };
+    
+    loadSettings();
+  }, [user]);
 
   const handleSave = async () => {
+    if (!user) return;
+    
+    // Validate required fields
+    if (!settings.host || !settings.port || !settings.username || !settings.fromEmail) {
+      toast.error('Please fill in all required fields');
+      return;
+    }
+    
+    // Password is required for new settings or when updating
+    if (!existingSettings && !settings.password) {
+      toast.error('Password is required');
+      return;
+    }
+    
     setSaving(true);
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+      const settingsData = {
+        user_id: user.id,
+        host: settings.host,
+        port: parseInt(settings.port),
+        username: settings.username,
+        from_email: settings.fromEmail,
+        from_name: settings.fromName || null,
+        encryption: settings.encryption,
+        ...(settings.password ? { password: settings.password } : {}),
+      };
+      
+      if (existingSettings) {
+        // Update existing settings
+        const updateData = { ...settingsData };
+        delete (updateData as Record<string, unknown>).user_id;
+        
+        const { error } = await supabase
+          .from('user_smtp_settings')
+          .update(updateData)
+          .eq('user_id', user.id);
+        
+        if (error) throw error;
+      } else {
+        // Insert new settings
+        if (!settings.password) {
+          toast.error('Password is required');
+          setSaving(false);
+          return;
+        }
+        
+        const { error } = await supabase
+          .from('user_smtp_settings')
+          .insert({ ...settingsData, password: settings.password });
+        
+        if (error) throw error;
+        setExistingSettings(true);
+      }
+      
+      // Clear password field after save
+      setSettings(prev => ({ ...prev, password: '' }));
       toast.success('Settings saved successfully!');
     } catch (error) {
+      console.error('Failed to save settings:', error);
       toast.error('Failed to save settings');
     } finally {
       setSaving(false);
@@ -65,11 +144,14 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      if (!settings.host || !settings.port || !settings.username || !settings.password || !settings.fromEmail) {
+      if (!settings.host || !settings.port || !settings.username || !settings.fromEmail) {
         throw new Error('Please fill in all SMTP fields including From Email');
       }
       if (!testEmail) {
         throw new Error('Please enter a test email address');
+      }
+      if (!existingSettings) {
+        throw new Error('Please save your SMTP settings first');
       }
 
       const response = await supabase.functions.invoke('send-email', {
@@ -77,15 +159,6 @@ export default function Settings() {
           recipientEmail: testEmail,
           subject: 'SMTP Test Email - Your Setup Works!',
           body: `This is a test email from your email outreach tool.\n\nIf you received this, your SMTP configuration is working correctly!\n\nSettings used:\n- Host: ${settings.host}\n- Port: ${settings.port}\n- Encryption: ${settings.encryption}\n- From: ${settings.fromName ? `${settings.fromName} <${settings.fromEmail}>` : settings.fromEmail}`,
-          smtp: {
-            host: settings.host,
-            port: parseInt(settings.port),
-            username: settings.username,
-            password: settings.password,
-            fromEmail: settings.fromEmail,
-            fromName: settings.fromName,
-            encryption: settings.encryption,
-          },
           testMode: true,
         },
       });
@@ -101,14 +174,25 @@ export default function Settings() {
 
       setTestResult('success');
       toast.success(`Test email sent to ${testEmail}! Check your inbox.`);
-    } catch (error: any) {
-      console.error('Test email error:', error);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'SMTP test failed';
+      console.error('Test email error:', errorMessage);
       setTestResult('error');
-      toast.error(error.message || 'SMTP test failed');
+      toast.error(errorMessage);
     } finally {
       setTesting(false);
     }
   };
+
+  if (loading) {
+    return (
+      <AppLayout title="Settings">
+        <div className="flex items-center justify-center py-20">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+        </div>
+      </AppLayout>
+    );
+  }
 
   return (
     <AppLayout title="Settings">
@@ -123,7 +207,7 @@ export default function Settings() {
               <div>
                 <CardTitle>SMTP Configuration</CardTitle>
                 <CardDescription>
-                  Configure your email server to send campaigns
+                  Configure your email server to send campaigns. Credentials are stored securely on the server.
                 </CardDescription>
               </div>
             </div>
@@ -180,11 +264,13 @@ export default function Settings() {
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="password">Password</Label>
+                <Label htmlFor="password">
+                  Password {existingSettings && <span className="text-muted-foreground">(leave blank to keep current)</span>}
+                </Label>
                 <Input
                   id="password"
                   type="password"
-                  placeholder="••••••••"
+                  placeholder={existingSettings ? "••••••••" : "Enter password"}
                   value={settings.password}
                   onChange={(e) => setSettings({ ...settings, password: e.target.value })}
                 />
@@ -304,7 +390,7 @@ export default function Settings() {
               </p>
             </div>
             <div className="flex items-center gap-3">
-              <Button onClick={handleTest} disabled={testing || !testEmail}>
+              <Button onClick={handleTest} disabled={testing || !testEmail || !existingSettings}>
                 {testing ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : testResult === 'success' ? (
@@ -321,6 +407,9 @@ export default function Settings() {
               )}
               {testResult === 'error' && (
                 <span className="text-sm text-destructive">Failed - check settings</span>
+              )}
+              {!existingSettings && (
+                <span className="text-sm text-muted-foreground">Save settings first</span>
               )}
             </div>
           </CardContent>
