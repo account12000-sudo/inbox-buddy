@@ -7,6 +7,41 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
 };
 
+interface SendEmailRequest {
+  queueItemId?: string;
+  campaignId?: string;
+  recipientEmail: string;
+  subject: string;
+  body: string;
+  testMode?: boolean;
+}
+
+// Sanitize HTML to prevent XSS and injection attacks
+function sanitizeHtml(input: string): string {
+  // Escape HTML special characters
+  const escaped = input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#x27;");
+  
+  // Convert newlines to <br> for HTML emails
+  return escaped.replace(/\n/g, "<br>");
+}
+
+// Validate email format
+function isValidEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email) && email.length <= 254;
+}
+
+// Validate subject for header injection
+function isValidSubject(subject: string): boolean {
+  // Check for newlines or carriage returns (header injection)
+  return !(/[\r\n]/.test(subject)) && subject.length <= 998;
+}
+
 interface SmtpConfig {
   host: string;
   port: number;
@@ -15,16 +50,6 @@ interface SmtpConfig {
   fromEmail: string;
   fromName: string;
   encryption: "tls" | "ssl" | "none";
-}
-
-interface SendEmailRequest {
-  queueItemId?: string;
-  campaignId?: string;
-  recipientEmail: string;
-  subject: string;
-  body: string;
-  smtp: SmtpConfig;
-  testMode?: boolean;
 }
 
 async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, body: string) {
@@ -41,16 +66,19 @@ async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, b
   });
 
   try {
+    // Sanitize body for HTML
+    const sanitizedHtml = sanitizeHtml(body);
+    
     await client.send({
       from: smtp.fromName ? `${smtp.fromName} <${smtp.fromEmail}>` : smtp.fromEmail,
       to: to,
       subject: subject,
-      content: body,
-      html: body.replace(/\n/g, "<br>"),
+      content: body, // Plain text version
+      html: sanitizedHtml, // Sanitized HTML version
     });
     await client.close();
     return { success: true };
-  } catch (error: any) {
+  } catch (error: unknown) {
     await client.close();
     throw error;
   }
@@ -70,7 +98,10 @@ serve(async (req: Request): Promise<Response> => {
     // Get auth header to verify user
     const authHeader = req.headers.get("Authorization");
     if (!authHeader) {
-      throw new Error("Missing authorization header");
+      return new Response(
+        JSON.stringify({ success: false, error: "Authorization required" }),
+        { status: 401, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
 
     // Verify user
@@ -79,17 +110,63 @@ serve(async (req: Request): Promise<Response> => {
     );
 
     if (authError || !user) {
-      throw new Error("Unauthorized");
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid credentials" }),
+        { status: 401, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
 
-    const { queueItemId, campaignId, recipientEmail, subject, body, smtp, testMode }: SendEmailRequest = await req.json();
+    const { queueItemId, campaignId, recipientEmail, subject, body, testMode }: SendEmailRequest = await req.json();
+
+    // Validate recipient email
+    if (!recipientEmail || !isValidEmail(recipientEmail)) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid recipient email" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Validate subject
+    if (!subject || !isValidSubject(subject)) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid subject" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Validate body
+    if (!body || body.length > 100000) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid email body" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Get SMTP settings from database (not from client)
+    const { data: smtpData, error: smtpError } = await supabase
+      .from("user_smtp_settings")
+      .select("*")
+      .eq("user_id", user.id)
+      .single();
+
+    if (smtpError || !smtpData) {
+      return new Response(
+        JSON.stringify({ success: false, error: "SMTP not configured. Please configure in Settings." }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    const smtp: SmtpConfig = {
+      host: smtpData.host,
+      port: smtpData.port,
+      username: smtpData.username,
+      password: smtpData.password,
+      fromEmail: smtpData.from_email,
+      fromName: smtpData.from_name || "",
+      encryption: smtpData.encryption as "tls" | "ssl" | "none",
+    };
 
     console.log(`Processing email request - testMode: ${testMode}, recipient: ${recipientEmail}`);
-
-    // Validate SMTP config
-    if (!smtp.host || !smtp.port || !smtp.username || !smtp.password || !smtp.fromEmail) {
-      throw new Error("Invalid SMTP configuration");
-    }
 
     // Test mode - just send email without database updates
     if (testMode) {
@@ -98,16 +175,16 @@ serve(async (req: Request): Promise<Response> => {
       console.log("Test email sent successfully");
       return new Response(
         JSON.stringify({ success: true, message: "Test email sent successfully" }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
     }
 
     // Campaign mode - full tracking
     if (!queueItemId || !campaignId) {
-      throw new Error("queueItemId and campaignId required for campaign emails");
+      return new Response(
+        JSON.stringify({ success: false, error: "queueItemId and campaignId required for campaign emails" }),
+        { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
 
     // Check if already sent to this recipient in this campaign (duplicate protection)
@@ -129,10 +206,7 @@ serve(async (req: Request): Promise<Response> => {
       
       return new Response(
         JSON.stringify({ success: true, message: "Duplicate skipped", skipped: true }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
     }
 
@@ -153,7 +227,7 @@ serve(async (req: Request): Promise<Response> => {
         .update({ status: "sent" })
         .eq("id", queueItemId);
 
-      // Record in sent_emails
+      // Record in sent_emails with tracking token
       await supabase.from("sent_emails").insert({
         user_id: user.id,
         campaign_id: campaignId,
@@ -178,13 +252,11 @@ serve(async (req: Request): Promise<Response> => {
 
       return new Response(
         JSON.stringify({ success: true, message: "Email sent successfully" }),
-        {
-          status: 200,
-          headers: { "Content-Type": "application/json", ...corsHeaders },
-        }
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
       );
-    } catch (smtpError: any) {
-      console.error("SMTP error:", smtpError);
+    } catch (smtpError: unknown) {
+      const errorMessage = smtpError instanceof Error ? smtpError.message : "SMTP error";
+      console.error("SMTP error:", errorMessage);
       
       // Mark as failed in queue
       await supabase
@@ -192,16 +264,17 @@ serve(async (req: Request): Promise<Response> => {
         .update({ status: "failed" })
         .eq("id", queueItemId);
 
-      throw new Error(`SMTP error: ${smtpError.message}`);
+      return new Response(
+        JSON.stringify({ success: false, error: "Failed to send email" }),
+        { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
     }
-  } catch (error: any) {
-    console.error("Error in send-email function:", error);
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    console.error("Error in send-email function:", errorMessage);
     return new Response(
-      JSON.stringify({ success: false, error: error.message }),
-      {
-        status: 500,
-        headers: { "Content-Type": "application/json", ...corsHeaders },
-      }
+      JSON.stringify({ success: false, error: "An error occurred" }),
+      { status: 500, headers: { "Content-Type": "application/json", ...corsHeaders } }
     );
   }
 });

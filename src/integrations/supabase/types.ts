@@ -128,6 +128,7 @@ export type Database = {
           sent_at: string
           status: string
           subject: string
+          tracking_token: string | null
           user_id: string
         }
         Insert: {
@@ -139,6 +140,7 @@ export type Database = {
           sent_at?: string
           status?: string
           subject: string
+          tracking_token?: string | null
           user_id: string
         }
         Update: {
@@ -150,6 +152,7 @@ export type Database = {
           sent_at?: string
           status?: string
           subject?: string
+          tracking_token?: string | null
           user_id?: string
         }
         Relationships: [
@@ -199,6 +202,48 @@ export type Database = {
             referencedColumns: ["id"]
           },
         ]
+      }
+      user_smtp_settings: {
+        Row: {
+          created_at: string
+          encryption: string
+          from_email: string
+          from_name: string | null
+          host: string
+          id: string
+          password: string
+          port: number
+          updated_at: string
+          user_id: string
+          username: string
+        }
+        Insert: {
+          created_at?: string
+          encryption?: string
+          from_email: string
+          from_name?: string | null
+          host: string
+          id?: string
+          password: string
+          port?: number
+          updated_at?: string
+          user_id: string
+          username: string
+        }
+        Update: {
+          created_at?: string
+          encryption?: string
+          from_email?: string
+          from_name?: string | null
+          host?: string
+          id?: string
+          password?: string
+          port?: number
+          updated_at?: string
+          user_id?: string
+          username?: string
+        }
+        Relationships: []
       }
     }
     Views: {

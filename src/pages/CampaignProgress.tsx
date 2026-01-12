@@ -36,18 +36,6 @@ interface QueueItem {
   status: string;
 }
 
-interface SmtpSettings {
-  host: string;
-  port: string;
-  username: string;
-  password: string;
-  fromEmail: string;
-  fromName: string;
-  encryption: 'tls' | 'ssl' | 'none';
-}
-
-const STORAGE_KEY = 'smtp_settings';
-
 export default function CampaignProgress() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -56,29 +44,31 @@ export default function CampaignProgress() {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [sendingEmail, setSendingEmail] = useState<string | null>(null);
-  const [smtpSettings, setSmtpSettings] = useState<SmtpSettings | null>(null);
-  const [smtpError, setSmtpError] = useState<string | null>(null);
+  const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null);
   const timerRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
 
-  // Load SMTP settings
+  // Check if SMTP is configured
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      try {
-        const settings = JSON.parse(saved);
-        if (settings.host && settings.port && settings.username && settings.password && settings.fromEmail) {
-          setSmtpSettings(settings);
-        } else {
-          setSmtpError('SMTP settings are incomplete. Please configure in Settings.');
-        }
-      } catch (e) {
-        setSmtpError('Failed to load SMTP settings. Please configure in Settings.');
+    const checkSmtpSettings = async () => {
+      if (!user) return;
+      
+      const { data, error } = await supabase
+        .from('user_smtp_settings')
+        .select('id')
+        .eq('user_id', user.id)
+        .maybeSingle();
+      
+      if (error) {
+        console.error('Error checking SMTP settings:', error);
+        setSmtpConfigured(false);
+      } else {
+        setSmtpConfigured(!!data);
       }
-    } else {
-      setSmtpError('SMTP not configured. Please set up your email server in Settings.');
-    }
-  }, []);
+    };
+    
+    checkSmtpSettings();
+  }, [user]);
 
   const fetchCampaign = useCallback(async () => {
     if (!id || !user) return;
@@ -117,7 +107,7 @@ export default function CampaignProgress() {
 
   // Send email via edge function
   const sendEmail = useCallback(async (queueItem: QueueItem) => {
-    if (!campaign || !smtpSettings || !session) return false;
+    if (!campaign || !smtpConfigured || !session) return false;
 
     setSendingEmail(queueItem.recipient_email);
 
@@ -129,15 +119,6 @@ export default function CampaignProgress() {
           recipientEmail: queueItem.recipient_email,
           subject: campaign.subject,
           body: campaign.body,
-          smtp: {
-            host: smtpSettings.host,
-            port: parseInt(smtpSettings.port),
-            username: smtpSettings.username,
-            password: smtpSettings.password,
-            fromEmail: smtpSettings.fromEmail,
-            fromName: smtpSettings.fromName,
-            encryption: smtpSettings.encryption,
-          },
         },
       });
 
@@ -159,21 +140,22 @@ export default function CampaignProgress() {
       );
 
       return true;
-    } catch (error: any) {
-      console.error('Error sending email:', error);
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      console.error('Error sending email:', errorMessage);
       setQueue((prev) =>
         prev.map((q) => (q.id === queueItem.id ? { ...q, status: 'failed' } : q))
       );
-      toast.error(`Failed to send to ${queueItem.recipient_email}: ${error.message}`);
+      toast.error(`Failed to send to ${queueItem.recipient_email}`);
       return false;
     } finally {
       setSendingEmail(null);
     }
-  }, [campaign, smtpSettings, session]);
+  }, [campaign, smtpConfigured, session]);
 
   // Process email queue
   const processQueue = useCallback(async () => {
-    if (!campaign || campaign.status !== 'running' || !smtpSettings) return;
+    if (!campaign || campaign.status !== 'running' || !smtpConfigured) return;
 
     const pendingEmails = queue.filter((q) => q.status === 'pending');
     
@@ -198,11 +180,11 @@ export default function CampaignProgress() {
         processQueue();
       }, campaign.interval_seconds * 1000);
     }
-  }, [campaign, queue, smtpSettings, sendEmail]);
+  }, [campaign, queue, smtpConfigured, sendEmail]);
 
   // Start/stop the queue processor
   useEffect(() => {
-    if (campaign?.status === 'running' && smtpSettings && !isRunningRef.current) {
+    if (campaign?.status === 'running' && smtpConfigured && !isRunningRef.current) {
       isRunningRef.current = true;
       processQueue();
     }
@@ -212,7 +194,7 @@ export default function CampaignProgress() {
         clearTimeout(timerRef.current);
       }
     };
-  }, [campaign?.status, smtpSettings, processQueue]);
+  }, [campaign?.status, smtpConfigured, processQueue]);
 
   const handlePause = async () => {
     if (!campaign) return;
@@ -275,12 +257,12 @@ export default function CampaignProgress() {
     <AppLayout title="Campaign Progress">
       <div className="max-w-4xl space-y-6">
         {/* SMTP Warning */}
-        {smtpError && (
+        {smtpConfigured === false && (
           <div className="flex items-center gap-3 p-4 rounded-lg bg-warning/10 text-warning border border-warning/20">
             <AlertTriangle className="h-5 w-5 shrink-0" />
             <div className="flex-1">
               <p className="font-medium">SMTP Configuration Required</p>
-              <p className="text-sm opacity-80">{smtpError}</p>
+              <p className="text-sm opacity-80">Please configure your email server in Settings to send emails.</p>
             </div>
             <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>
               Go to Settings
@@ -337,7 +319,7 @@ export default function CampaignProgress() {
               )}
               {campaign.status === 'paused' && (
                 <>
-                  <Button onClick={handleResume} disabled={!smtpSettings}>
+                  <Button onClick={handleResume} disabled={!smtpConfigured}>
                     <Play className="mr-2 h-4 w-4" />
                     Resume
                   </Button>
@@ -352,7 +334,7 @@ export default function CampaignProgress() {
                   Back to Dashboard
                 </Button>
               )}
-              {campaign.status === 'draft' && smtpSettings && (
+              {campaign.status === 'draft' && smtpConfigured && (
                 <Button onClick={handleResume}>
                   <Play className="mr-2 h-4 w-4" />
                   Start Campaign
