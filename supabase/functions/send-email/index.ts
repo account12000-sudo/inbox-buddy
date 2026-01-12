@@ -1,6 +1,6 @@
 import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { SMTPClient } from "https://deno.land/x/denomailer@1.6.0/mod.ts";
+
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -52,61 +52,187 @@ interface SmtpConfig {
   encryption: "tls" | "ssl" | "none";
 }
 
-async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, body: string) {
-  // Configure connection based on encryption type
-  // - ssl: implicit TLS on port 465
-  // - tls: STARTTLS upgrade on port 587/25
-  // - none: no encryption
-  const connectionConfig: {
-    hostname: string;
-    port: number;
-    tls?: boolean;
-    auth: { username: string; password: string };
-  } = {
-    hostname: smtp.host,
-    port: smtp.port,
-    auth: {
-      username: smtp.username,
-      password: smtp.password,
-    },
-  };
+function toBase64(value: string): string {
+  // Credentials are ASCII in almost all SMTP setups; btoa is sufficient here.
+  return btoa(value);
+}
 
-  // Only set tls: true for implicit SSL (port 465)
-  // For STARTTLS (port 587), we don't set tls - denomailer handles STARTTLS automatically
-  if (smtp.encryption === "ssl") {
-    connectionConfig.tls = true;
+function escapeHeaderValue(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/[\r\n]/g, " ");
+}
+
+function normalizeCrlf(value: string): string {
+  return value.replace(/\r?\n/g, "\r\n");
+}
+
+function dotStuff(valueCrlf: string): string {
+  // RFC 5321 dot-stuffing
+  return valueCrlf.replace(/(^|\r\n)\./g, "$1..");
+}
+
+class SmtpWire {
+  private conn: Deno.Conn;
+  private pending = "";
+  private readonly decoder = new TextDecoder();
+  private readonly encoder = new TextEncoder();
+  private readonly readBuf = new Uint8Array(4096);
+
+  constructor(conn: Deno.Conn, private hostname: string) {
+    this.conn = conn;
   }
 
-  const client = new SMTPClient({
-    connection: connectionConfig,
-  });
+  close() {
+    try {
+      this.conn.close();
+    } catch {
+      // ignore
+    }
+  }
 
-  let connected = false;
-  
-  try {
-    // Sanitize body for HTML
-    const sanitizedHtml = sanitizeHtml(body);
-    
-    await client.send({
-      from: smtp.fromName ? `${smtp.fromName} <${smtp.fromEmail}>` : smtp.fromEmail,
-      to: to,
-      subject: subject,
-      content: body, // Plain text version
-      html: sanitizedHtml, // Sanitized HTML version
-    });
-    connected = true;
-    await client.close();
-    return { success: true };
-  } catch (error: unknown) {
-    // Only try to close if connection was established
-    if (connected) {
-      try {
-        await client.close();
-      } catch {
-        // Ignore close errors
+  private async readLine(): Promise<string> {
+    while (true) {
+      const nl = this.pending.indexOf("\n");
+      if (nl >= 0) {
+        const line = this.pending.slice(0, nl + 1);
+        this.pending = this.pending.slice(nl + 1);
+        return line.replace(/\r?\n$/, "");
+      }
+
+      const n = await this.conn.read(this.readBuf);
+      if (n === null) throw new Error("SMTP connection closed");
+      this.pending += this.decoder.decode(this.readBuf.subarray(0, n));
+    }
+  }
+
+  private async readResponse(): Promise<{ code: number; raw: string }> {
+    const first = await this.readLine();
+    const codeStr = first.slice(0, 3);
+    const code = Number(codeStr);
+    if (!Number.isFinite(code)) {
+      throw new Error(`SMTP invalid response: ${first}`);
+    }
+
+    const lines = [first];
+
+    // Multiline response: "250-..." then ends with "250 ..."
+    if (first[3] === "-") {
+      while (true) {
+        const line = await this.readLine();
+        lines.push(line);
+        if (line.startsWith(`${codeStr} `)) break;
       }
     }
-    throw error;
+
+    return { code, raw: lines.join("\n") };
+  }
+
+  private assertExpected(
+    res: { code: number; raw: string },
+    expected: number | number[],
+    context: string,
+  ) {
+    const ok = Array.isArray(expected)
+      ? expected.includes(res.code)
+      : res.code === expected;
+
+    if (!ok) {
+      throw new Error(`SMTP unexpected response for ${context}: got ${res.code}\n${res.raw}`);
+    }
+  }
+
+  async readExpected(expected: number | number[], context = "response"): Promise<void> {
+    const res = await this.readResponse();
+    this.assertExpected(res, expected, context);
+  }
+
+  async cmd(command: string, expected: number | number[]): Promise<void> {
+    await this.conn.write(this.encoder.encode(`${command}\r\n`));
+    await this.readExpected(expected, command);
+  }
+
+  async writeRaw(data: string): Promise<void> {
+    await this.conn.write(this.encoder.encode(data));
+  }
+
+  async startTls(): Promise<void> {
+    const tlsConn = await Deno.startTls(this.conn as Deno.TcpConn, {
+      hostname: this.hostname,
+    });
+    this.conn = tlsConn;
+    this.pending = "";
+  }
+}
+
+async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, body: string) {
+  if (!isValidEmail(smtp.fromEmail)) {
+    throw new Error("Invalid fromEmail in SMTP settings");
+  }
+  if (!isValidEmail(to)) {
+    throw new Error("Invalid recipient email");
+  }
+  if (!smtp.host || !smtp.port || !smtp.username || !smtp.password) {
+    throw new Error("Incomplete SMTP settings");
+  }
+
+  const conn = smtp.encryption === "ssl"
+    ? await Deno.connectTls({ hostname: smtp.host, port: smtp.port })
+    : await Deno.connect({ hostname: smtp.host, port: smtp.port });
+
+  const wire = new SmtpWire(conn, smtp.host);
+
+  try {
+    // Server greeting (must be read before sending any commands)
+    await wire.readExpected(220, "greeting");
+
+    await wire.cmd("EHLO localhost", 250);
+
+    if (smtp.encryption === "tls") {
+      await wire.cmd("STARTTLS", 220);
+      await wire.startTls();
+      await wire.cmd("EHLO localhost", 250);
+    }
+
+    // AUTH (prefer LOGIN, fallback to PLAIN)
+    try {
+      await wire.cmd("AUTH LOGIN", 334);
+      await wire.cmd(toBase64(smtp.username), 334);
+      await wire.cmd(toBase64(smtp.password), 235);
+    } catch {
+      const plain = toBase64(`\u0000${smtp.username}\u0000${smtp.password}`);
+      await wire.cmd(`AUTH PLAIN ${plain}`, [235, 503]);
+    }
+
+    await wire.cmd(`MAIL FROM:<${smtp.fromEmail}>`, 250);
+    await wire.cmd(`RCPT TO:<${to}>`, [250, 251]);
+    await wire.cmd("DATA", 354);
+
+    const sanitizedHtml = sanitizeHtml(body);
+    const htmlCrlf = dotStuff(normalizeCrlf(sanitizedHtml));
+
+    const fromHeader = smtp.fromName
+      ? `"${escapeHeaderValue(smtp.fromName)}" <${smtp.fromEmail}>`
+      : smtp.fromEmail;
+
+    const message = [
+      `From: ${fromHeader}`,
+      `To: <${to}>`,
+      `Subject: ${subject}`,
+      `MIME-Version: 1.0`,
+      `Content-Type: text/html; charset="UTF-8"`,
+      `Content-Transfer-Encoding: 7bit`,
+      "",
+      htmlCrlf,
+      "",
+    ].join("\r\n");
+
+    await wire.writeRaw(`${message}\r\n.\r\n`);
+    await wire.readExpected(250, "end-of-data");
+
+    await wire.cmd("QUIT", 221);
+
+    return { success: true };
+  } finally {
+    wire.close();
   }
 }
 
