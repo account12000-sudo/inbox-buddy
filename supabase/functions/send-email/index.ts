@@ -53,18 +53,36 @@ interface SmtpConfig {
 }
 
 async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, body: string) {
-  const client = new SMTPClient({
-    connection: {
-      hostname: smtp.host,
-      port: smtp.port,
-      tls: smtp.encryption === "ssl",
-      auth: {
-        username: smtp.username,
-        password: smtp.password,
-      },
+  // Configure connection based on encryption type
+  // - ssl: implicit TLS on port 465
+  // - tls: STARTTLS upgrade on port 587/25
+  // - none: no encryption
+  const connectionConfig: {
+    hostname: string;
+    port: number;
+    tls?: boolean;
+    auth: { username: string; password: string };
+  } = {
+    hostname: smtp.host,
+    port: smtp.port,
+    auth: {
+      username: smtp.username,
+      password: smtp.password,
     },
+  };
+
+  // Only set tls: true for implicit SSL (port 465)
+  // For STARTTLS (port 587), we don't set tls - denomailer handles STARTTLS automatically
+  if (smtp.encryption === "ssl") {
+    connectionConfig.tls = true;
+  }
+
+  const client = new SMTPClient({
+    connection: connectionConfig,
   });
 
+  let connected = false;
+  
   try {
     // Sanitize body for HTML
     const sanitizedHtml = sanitizeHtml(body);
@@ -76,10 +94,18 @@ async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, b
       content: body, // Plain text version
       html: sanitizedHtml, // Sanitized HTML version
     });
+    connected = true;
     await client.close();
     return { success: true };
   } catch (error: unknown) {
-    await client.close();
+    // Only try to close if connection was established
+    if (connected) {
+      try {
+        await client.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
     throw error;
   }
 }
