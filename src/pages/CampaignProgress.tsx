@@ -51,6 +51,13 @@ export default function CampaignProgress() {
   const timerRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
 
+  const stopTimer = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
   // Keep queueRef in sync with queue state
   useEffect(() => {
     queueRef.current = queue;
@@ -144,13 +151,21 @@ export default function CampaignProgress() {
         throw new Error(data.error || 'Failed to send email');
       }
 
+      const isSkipped = !!data.skipped;
+
       // Update local state
       setQueue((prev) =>
-        prev.map((q) => (q.id === queueItem.id ? { ...q, status: 'sent' } : q))
+        prev.map((q) =>
+          q.id === queueItem.id
+            ? { ...q, status: isSkipped ? 'skipped' : 'sent' }
+            : q
+        )
       );
-      setCampaign((prev) =>
-        prev ? { ...prev, sent_count: prev.sent_count + 1 } : null
-      );
+      if (!isSkipped) {
+        setCampaign((prev) =>
+          prev ? { ...prev, sent_count: prev.sent_count + 1 } : null
+        );
+      }
 
       return true;
     } catch (error: unknown) {
@@ -187,36 +202,50 @@ export default function CampaignProgress() {
     }
 
     const nextEmail = pendingEmails[0];
-    const success = await sendEmail(nextEmail);
+    await sendEmail(nextEmail);
 
     // Schedule next email only if still running
     if (isRunningRef.current) {
+      stopTimer();
       timerRef.current = window.setTimeout(() => {
         processQueue();
       }, campaign.interval_seconds * 1000);
     }
-  }, [campaign, smtpConfigured, queueLoaded, sendEmail]);
+  }, [campaign, smtpConfigured, queueLoaded, sendEmail, stopTimer]);
 
-  // Start/stop the queue processor
+  // Start the queue processor once conditions are met
   useEffect(() => {
-    if (!loading && queueLoaded && campaign?.status === 'running' && smtpConfigured && !isRunningRef.current) {
+    if (
+      !loading &&
+      queueLoaded &&
+      campaign?.status === 'running' &&
+      smtpConfigured &&
+      !isRunningRef.current
+    ) {
       isRunningRef.current = true;
       processQueue();
     }
-
-    return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
-    };
   }, [campaign?.status, smtpConfigured, queueLoaded, loading, processQueue]);
+
+  // Stop timer on unmount
+  useEffect(() => {
+    return () => {
+      stopTimer();
+    };
+  }, [stopTimer]);
+
+  // If campaign stops running (pause/complete) or SMTP becomes unavailable, stop scheduling
+  useEffect(() => {
+    if (campaign?.status !== 'running' || !smtpConfigured) {
+      isRunningRef.current = false;
+      stopTimer();
+    }
+  }, [campaign?.status, smtpConfigured, stopTimer]);
 
   const handlePause = async () => {
     if (!campaign) return;
     isRunningRef.current = false;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
+    stopTimer();
     await supabase.from('campaigns').update({ status: 'paused' }).eq('id', campaign.id);
     setCampaign((prev) => prev ? { ...prev, status: 'paused' } : null);
     toast.info('Campaign paused');
@@ -234,9 +263,7 @@ export default function CampaignProgress() {
   const handleStop = async () => {
     if (!campaign) return;
     isRunningRef.current = false;
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
+    stopTimer();
     await supabase.from('campaigns').update({ status: 'completed' }).eq('id', campaign.id);
     setCampaign((prev) => prev ? { ...prev, status: 'completed' } : null);
     toast.info('Campaign stopped');
