@@ -20,6 +20,11 @@ interface SmtpSettings {
   encryption: 'tls' | 'ssl' | 'none';
 }
 
+function isValidEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email) && email.length <= 254;
+}
+
 export default function Settings() {
   const { user } = useAuth();
   const [settings, setSettings] = useState<SmtpSettings>({
@@ -76,28 +81,44 @@ export default function Settings() {
 
   const handleSave = async () => {
     if (!user) return;
-    
+
+    const host = settings.host.trim();
+    const portNum = Number(settings.port);
+    const username = settings.username.trim();
+    const fromEmail = settings.fromEmail.trim();
+    const fromName = settings.fromName.trim();
+
     // Validate required fields
-    if (!settings.host || !settings.port || !settings.username || !settings.fromEmail) {
+    if (!host || !settings.port || !username || !fromEmail) {
       toast.error('Please fill in all required fields');
       return;
     }
-    
+
+    if (!Number.isInteger(portNum) || portNum <= 0 || portNum > 65535) {
+      toast.error('Please enter a valid SMTP port');
+      return;
+    }
+
+    if (!isValidEmail(fromEmail)) {
+      toast.error('Please enter a valid From Email (e.g. hello@yourdomain.com)');
+      return;
+    }
+
     // Password is required for new settings or when updating
     if (!existingSettings && !settings.password) {
       toast.error('Password is required');
       return;
     }
-    
+
     setSaving(true);
     try {
       const settingsData = {
         user_id: user.id,
-        host: settings.host,
-        port: parseInt(settings.port),
-        username: settings.username,
-        from_email: settings.fromEmail,
-        from_name: settings.fromName || null,
+        host,
+        port: portNum,
+        username,
+        from_email: fromEmail,
+        from_name: fromName || null,
         encryption: settings.encryption,
         ...(settings.password ? { password: settings.password } : {}),
       };
@@ -144,11 +165,21 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      if (!settings.host || !settings.port || !settings.username || !settings.fromEmail) {
+      const host = settings.host.trim();
+      const fromEmail = settings.fromEmail.trim();
+      const testEmailTrimmed = testEmail.trim();
+
+      if (!host || !settings.port || !settings.username.trim() || !fromEmail) {
         throw new Error('Please fill in all SMTP fields including From Email');
       }
-      if (!testEmail) {
+      if (!isValidEmail(fromEmail)) {
+        throw new Error('From Email is invalid (please fix it in Sender Identity)');
+      }
+      if (!testEmailTrimmed) {
         throw new Error('Please enter a test email address');
+      }
+      if (!isValidEmail(testEmailTrimmed)) {
+        throw new Error('Test Email Address is invalid');
       }
       if (!existingSettings) {
         throw new Error('Please save your SMTP settings first');
