@@ -43,6 +43,7 @@ export default function CampaignProgress() {
   const { user, session } = useAuth();
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [queueLoaded, setQueueLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [sendingEmail, setSendingEmail] = useState<string | null>(null);
   const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null);
@@ -74,27 +75,32 @@ export default function CampaignProgress() {
   const fetchCampaign = useCallback(async () => {
     if (!id || !user) return;
 
+    setQueueLoaded(false);
+
     try {
-      const { data: campaignData, error: campaignError } = await supabase
-        .from('campaigns')
-        .select('*')
-        .eq('id', id)
-        .eq('user_id', user.id)
-        .single();
+      const [campaignRes, queueRes] = await Promise.all([
+        supabase
+          .from('campaigns')
+          .select('*')
+          .eq('id', id)
+          .eq('user_id', user.id)
+          .single(),
+        supabase
+          .from('email_queue')
+          .select('*')
+          .eq('campaign_id', id)
+          .order('created_at', { ascending: true }),
+      ]);
 
-      if (campaignError) throw campaignError;
-      setCampaign(campaignData);
+      if (campaignRes.error) throw campaignRes.error;
+      if (queueRes.error) throw queueRes.error;
 
-      const { data: queueData, error: queueError } = await supabase
-        .from('email_queue')
-        .select('*')
-        .eq('campaign_id', id)
-        .order('created_at', { ascending: true });
-
-      if (queueError) throw queueError;
-      setQueue(queueData || []);
+      // Important: set queue before campaign so the runner doesn't see an empty queue and auto-complete.
+      setQueue(queueRes.data || []);
+      setCampaign(campaignRes.data);
+      setQueueLoaded(true);
     } catch (error: unknown) {
-      console.error('Campaign fetch error');
+      console.error('Campaign fetch error', error);
       toast.error(getSafeErrorMessage(error));
       navigate('/dashboard');
     } finally {
@@ -156,16 +162,17 @@ export default function CampaignProgress() {
   // Process email queue
   const processQueue = useCallback(async () => {
     if (!campaign || campaign.status !== 'running' || !smtpConfigured) return;
+    if (!queueLoaded) return;
 
     const pendingEmails = queue.filter((q) => q.status === 'pending');
-    
+
     if (pendingEmails.length === 0) {
       // Campaign complete
       await supabase
         .from('campaigns')
         .update({ status: 'completed' })
         .eq('id', campaign.id);
-      setCampaign((prev) => prev ? { ...prev, status: 'completed' } : null);
+      setCampaign((prev) => (prev ? { ...prev, status: 'completed' } : null));
       toast.success('Campaign completed!');
       isRunningRef.current = false;
       return;
@@ -180,11 +187,11 @@ export default function CampaignProgress() {
         processQueue();
       }, campaign.interval_seconds * 1000);
     }
-  }, [campaign, queue, smtpConfigured, sendEmail]);
+  }, [campaign, queue, smtpConfigured, queueLoaded, sendEmail]);
 
   // Start/stop the queue processor
   useEffect(() => {
-    if (campaign?.status === 'running' && smtpConfigured && !isRunningRef.current) {
+    if (!loading && queueLoaded && campaign?.status === 'running' && smtpConfigured && !isRunningRef.current) {
       isRunningRef.current = true;
       processQueue();
     }
@@ -194,7 +201,7 @@ export default function CampaignProgress() {
         clearTimeout(timerRef.current);
       }
     };
-  }, [campaign?.status, smtpConfigured, processQueue]);
+  }, [campaign?.status, smtpConfigured, queueLoaded, loading, processQueue]);
 
   const handlePause = async () => {
     if (!campaign) return;
@@ -209,11 +216,11 @@ export default function CampaignProgress() {
 
   const handleResume = async () => {
     if (!campaign) return;
+    // Let the status-change effect start the processor with fresh state.
+    isRunningRef.current = false;
     await supabase.from('campaigns').update({ status: 'running' }).eq('id', campaign.id);
-    setCampaign((prev) => prev ? { ...prev, status: 'running' } : null);
-    isRunningRef.current = true;
+    setCampaign((prev) => (prev ? { ...prev, status: 'running' } : null));
     toast.success('Campaign resumed');
-    processQueue();
   };
 
   const handleStop = async () => {
@@ -252,6 +259,7 @@ export default function CampaignProgress() {
   const sentEmails = queue.filter((q) => q.status === 'sent');
   const pendingEmails = queue.filter((q) => q.status === 'pending');
   const failedEmails = queue.filter((q) => q.status === 'failed');
+  const sendingEmails = queue.filter((q) => q.status === 'sending');
 
   return (
     <AppLayout title="Campaign Progress">
@@ -266,6 +274,20 @@ export default function CampaignProgress() {
             </div>
             <Button variant="outline" size="sm" onClick={() => navigate('/settings')}>
               Go to Settings
+            </Button>
+          </div>
+        )}
+
+        {/* Inconsistent state warning (prevents "instant complete" leaving all items pending) */}
+        {campaign.status === 'completed' && (pendingEmails.length > 0 || sendingEmails.length > 0) && (
+          <div className="flex items-center gap-3 p-4 rounded-lg bg-warning/10 text-warning border border-warning/20">
+            <AlertTriangle className="h-5 w-5 shrink-0" />
+            <div className="flex-1">
+              <p className="font-medium">This campaign finished before the queue was processed</p>
+              <p className="text-sm opacity-80">Click continue to resume sending the remaining emails.</p>
+            </div>
+            <Button variant="outline" size="sm" onClick={handleResume} disabled={!smtpConfigured}>
+              Continue
             </Button>
           </div>
         )}
