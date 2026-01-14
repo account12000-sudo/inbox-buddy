@@ -43,12 +43,18 @@ export default function CampaignProgress() {
   const { user, session } = useAuth();
   const [campaign, setCampaign] = useState<Campaign | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
+  const queueRef = useRef<QueueItem[]>([]);
   const [queueLoaded, setQueueLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [sendingEmail, setSendingEmail] = useState<string | null>(null);
   const [smtpConfigured, setSmtpConfigured] = useState<boolean | null>(null);
   const timerRef = useRef<number | null>(null);
   const isRunningRef = useRef(false);
+
+  // Keep queueRef in sync with queue state
+  useEffect(() => {
+    queueRef.current = queue;
+  }, [queue]);
 
   // Check if SMTP is configured
   useEffect(() => {
@@ -159,12 +165,14 @@ export default function CampaignProgress() {
     }
   }, [campaign, smtpConfigured, session]);
 
-  // Process email queue
+  // Process email queue - uses ref to always get latest queue state
   const processQueue = useCallback(async () => {
     if (!campaign || campaign.status !== 'running' || !smtpConfigured) return;
     if (!queueLoaded) return;
 
-    const pendingEmails = queue.filter((q) => q.status === 'pending');
+    // Use ref to get the latest queue state
+    const currentQueue = queueRef.current;
+    const pendingEmails = currentQueue.filter((q) => q.status === 'pending');
 
     if (pendingEmails.length === 0) {
       // Campaign complete
@@ -179,15 +187,15 @@ export default function CampaignProgress() {
     }
 
     const nextEmail = pendingEmails[0];
-    await sendEmail(nextEmail);
+    const success = await sendEmail(nextEmail);
 
-    // Schedule next email
+    // Schedule next email only if still running
     if (isRunningRef.current) {
       timerRef.current = window.setTimeout(() => {
         processQueue();
       }, campaign.interval_seconds * 1000);
     }
-  }, [campaign, queue, smtpConfigured, queueLoaded, sendEmail]);
+  }, [campaign, smtpConfigured, queueLoaded, sendEmail]);
 
   // Start/stop the queue processor
   useEffect(() => {
