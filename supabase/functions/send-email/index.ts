@@ -164,10 +164,13 @@ class SmtpWire {
 }
 
 async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, body: string) {
-  if (!isValidEmail(smtp.fromEmail)) {
-    throw new Error("Invalid fromEmail in SMTP settings");
+  const fromEmail = smtp.fromEmail.trim();
+  const recipientEmail = to.trim();
+
+  if (!isValidEmail(fromEmail)) {
+    throw new Error("Invalid sender email (From Email)");
   }
-  if (!isValidEmail(to)) {
+  if (!isValidEmail(recipientEmail)) {
     throw new Error("Invalid recipient email");
   }
   if (!smtp.host || !smtp.port || !smtp.username || !smtp.password) {
@@ -202,20 +205,21 @@ async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, b
       await wire.cmd(`AUTH PLAIN ${plain}`, [235, 503]);
     }
 
-    await wire.cmd(`MAIL FROM:<${smtp.fromEmail}>`, 250);
-    await wire.cmd(`RCPT TO:<${to}>`, [250, 251]);
+    await wire.cmd(`MAIL FROM:<${fromEmail}>`, 250);
+    await wire.cmd(`RCPT TO:<${recipientEmail}>`, [250, 251]);
     await wire.cmd("DATA", 354);
 
     const sanitizedHtml = sanitizeHtml(body);
     const htmlCrlf = dotStuff(normalizeCrlf(sanitizedHtml));
 
-    const fromHeader = smtp.fromName
-      ? `"${escapeHeaderValue(smtp.fromName)}" <${smtp.fromEmail}>`
-      : smtp.fromEmail;
+    const fromName = smtp.fromName?.trim();
+    const fromHeader = fromName
+      ? `"${escapeHeaderValue(fromName)}" <${fromEmail}>`
+      : fromEmail;
 
     const message = [
       `From: ${fromHeader}`,
-      `To: <${to}>`,
+      `To: <${recipientEmail}>`,
       `Subject: ${subject}`,
       `MIME-Version: 1.0`,
       `Content-Type: text/html; charset="UTF-8"`,
@@ -235,7 +239,6 @@ async function sendEmailViaSMTP(smtp: SmtpConfig, to: string, subject: string, b
     wire.close();
   }
 }
-
 serve(async (req: Request): Promise<Response> => {
   // Handle CORS preflight
   if (req.method === "OPTIONS") {
@@ -323,12 +326,21 @@ serve(async (req: Request): Promise<Response> => {
     // Test mode - just send email without database updates
     if (testMode) {
       console.log("Test mode - sending test email");
-      await sendEmailViaSMTP(smtp, recipientEmail, subject, body);
-      console.log("Test email sent successfully");
-      return new Response(
-        JSON.stringify({ success: true, message: "Test email sent successfully" }),
-        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
-      );
+      try {
+        await sendEmailViaSMTP(smtp, recipientEmail, subject, body);
+        console.log("Test email sent successfully");
+        return new Response(
+          JSON.stringify({ success: true, message: "Test email sent successfully" }),
+          { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        );
+      } catch (smtpError: unknown) {
+        const errorMessage = smtpError instanceof Error ? smtpError.message : "SMTP error";
+        console.error("SMTP error (test):", errorMessage);
+        return new Response(
+          JSON.stringify({ success: false, error: errorMessage }),
+          { status: 400, headers: { "Content-Type": "application/json", ...corsHeaders } }
+        );
+      }
     }
 
     // Campaign mode - full tracking
