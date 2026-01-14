@@ -351,23 +351,62 @@ serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // Check if already sent to this recipient in this campaign (duplicate protection)
+    // Ensure the campaign belongs to the authenticated user (service-role client bypasses RLS)
+    const { data: ownedCampaign, error: ownedCampaignError } = await supabase
+      .from("campaigns")
+      .select("id")
+      .eq("id", campaignId)
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    if (ownedCampaignError || !ownedCampaign) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Campaign not found" }),
+        { status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Ensure queue item belongs to the campaign
+    const { data: queueItem, error: queueItemError } = await supabase
+      .from("email_queue")
+      .select("id, status")
+      .eq("id", queueItemId)
+      .eq("campaign_id", campaignId)
+      .maybeSingle();
+
+    if (queueItemError || !queueItem) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Queue item not found" }),
+        { status: 404, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // If already finalized, don't send again
+    if (queueItem.status === "sent" || queueItem.status === "skipped") {
+      return new Response(
+        JSON.stringify({ success: true, message: "Already processed", skipped: queueItem.status === "skipped" }),
+        { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
+      );
+    }
+
+    // Check if already sent to this recipient before (global duplicate protection per user)
     const { data: existingSent } = await supabase
       .from("sent_emails")
       .select("id")
       .eq("user_id", user.id)
-      .eq("campaign_id", campaignId)
       .eq("recipient_email", recipientEmail)
+      .eq("status", "sent")
       .maybeSingle();
 
     if (existingSent) {
-      console.log(`Duplicate detected - already sent to ${recipientEmail} in campaign ${campaignId}`);
-      // Mark as sent in queue (skip duplicate)
+      console.log(`Duplicate detected - already sent to ${recipientEmail} before`);
+
+      // Mark as skipped in queue (don't increment sent_count)
       await supabase
         .from("email_queue")
-        .update({ status: "sent" })
+        .update({ status: "skipped" })
         .eq("id", queueItemId);
-      
+
       return new Response(
         JSON.stringify({ success: true, message: "Duplicate skipped", skipped: true }),
         { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
